@@ -64,7 +64,7 @@ def dataset_csv(path, column, batch_size=32):
     )
     return data
 
-def train(model, aenc, data, epochs=10):
+def train(model, aenc, data, epochs=10, max_steps=None):
     # set up optimizer
     optim = torch.optim.Adam(aenc.parameters(), lr=1e-3)
     loss_fn = torch.nn.MSELoss()
@@ -84,14 +84,19 @@ def train(model, aenc, data, epochs=10):
             ]) / ne
 
     # run some data epochs
-    for k in range(epochs):
+    for e in range(epochs):
         # standard gradient update
-        for batch in tqdm(data):
+        for step, batch in enumerate(tqdm(data, desc=f'EPOCH {e}')):
             optim.zero_grad()
             loss = run_loss(batch)
             loss.backward()
             optim.step()
 
+            # break if we hit max steps
+            if max_steps is not None and step >= max_steps:
+                break
+
         # print out loss
         eval_loss = run_eval(16)
-        print(f"epoch {k}: {eval_loss}")
+        print(f'LOSS: {eval_loss}')
+
