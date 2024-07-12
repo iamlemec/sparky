@@ -83,15 +83,26 @@ class AutoEncoder(nn.Module):
         return feats
 
     # embed: [batch_size, embed_size]
-    def forward(self, embed, dead_cutoff=None, dead_topk=512):
+    def forward(self, embed, random_samp=None):
         # sparsifry and index
         project = self.encoder(embed)
-        weights, feats = project.topk(self.topk, dim=-1, sorted=False)
+        weights0, feats0 = project.topk(self.topk, dim=-1, sorted=False)
+
+        # randomize some of the features
+        if random_samp is not None:
+            batch_size, _ = embed.shape
+            random_feats = torch.randint(self.num_features, (batch_size, random_samp), device=embed.device)
+            random_weights = torch.gather(project, -1, random_feats)
+            feats = torch.cat([feats0, random_feats], dim=-1)
+            weights = torch.cat([weights0, random_weights], dim=-1)
+        else:
+            feats = feats0
+            weights = weights0
 
         # accumulate usage stats
         with torch.no_grad():
             batch_size, _ = embed.shape
-            total = bincount(feats, self.num_features)
+            total = bincount(feats0, self.num_features)
             self.eval_usage += total
             self.last_usage += batch_size # increment all
             self.last_usage *= 1 - total.clamp(max=1) # zero out used
@@ -100,20 +111,11 @@ class AutoEncoder(nn.Module):
         recon = self.decoder(feats, weights)
         embed1 = F.normalize(recon)
 
-        # add in resurrected feats
-        if dead_cutoff is not None:
-            # find dead_topk least used features
-            dead_mask = self.last_usage > dead_cutoff
-            dead_total = dead_mask.sum().item()
-            dead_project = project[:, dead_mask]
+        # compute the entropy of the distribution
+        logits = weights - torch.logsumexp(weights, dim=-1, keepdim=True)
+        entropy = -(logits.exp()*logits).sum(dim=-1)
 
-            # reconstruct undead embeddings
-            undead_topk = np.minimum(dead_topk, dead_total)
-            undead_weights, undead_feats = dead_project.topk(undead_topk, dim=-1, sorted=False)
-            undead_recon = self.decoder(undead_feats, undead_weights, bias=False)
-            return embed1, undead_recon
-        else:
-            return embed1, None
+        return embed1, entropy
 
 class Trainer:
     def __init__(self, embed, model):
@@ -126,21 +128,21 @@ class Trainer:
             vecs = self.embed(text)
         return self.model.features(vecs)
 
-    def loss(self, text, dead_cutoff=None, dead_topk=512, dead_weight=0.03):
+    def loss(self, text, entropy_weight=None, random_samp=None):
         # get embeddings and run model
         with torch.no_grad():
             vecs = self.embed(text)
-        vecs1, uvecs = self.model(vecs, dead_cutoff=dead_cutoff, dead_topk=dead_topk)
+        vecs1, entropy = self.model(vecs, random_samp=random_samp)
 
         # compute loss
-        scale = sqrt(vecs.numel())
-        loss0 = self.loss_fn(vecs, vecs1)
-        loss1 = self.loss_fn(vecs1 - vecs, uvecs) if uvecs is not None else 0.0
-        return scale * (loss0 + dead_weight*loss1)
+        bs, es = vecs.shape
+        loss_mse = self.loss_fn(vecs, vecs1)
+        loss_ent = entropy_weight * entropy.mean() if entropy_weight is not None else 0.0
+        return sqrt(bs) * ( sqrt(es) * loss_mse - loss_ent )
 
     def train(
         self, data, epochs=10, max_steps=None, learning_rate=1e-3, epsilon=1e-8, grad_clip=1.0,
-        eval_steps=8, dead_cutoff=10_000, dead_topk=512, dead_weight=0.03
+        eval_steps=8, entropy_weight=0.01, random_samp=32, dead_cutoff=100_000
     ):
         # set up optimizer
         params = self.model.parameters()
@@ -152,9 +154,7 @@ class Trainer:
             for step, batch in enumerate(tqdm(data, desc=f'EPOCH {e}')):
                 # accumulate gradients
                 optim.zero_grad()
-                loss = self.loss(
-                    batch, dead_cutoff=dead_cutoff, dead_topk=dead_topk, dead_weight=dead_weight
-                )
+                loss = self.loss(batch, entropy_weight=entropy_weight, random_samp=random_samp)
                 loss.backward()
 
                 # process and apply grads
