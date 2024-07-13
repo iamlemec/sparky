@@ -29,11 +29,11 @@ class Encoder(nn.Module):
     def __init__(self, embed_size, num_features):
         super().__init__()
         self.bias = nn.Parameter(torch.empty(embed_size))
-        self.weight = nn.Parameter(torch.empty(num_features, embed_size))
+        self.linear = nn.Linear(embed_size, num_features, bias=False)
 
     def forward(self, embed):
         embed0 = embed - self.bias
-        weights = F.linear(embed0, self.weight)
+        weights = self.linear(embed0)
         return weights
 
 # maps from (sparse) weights to reconstructed embedding
@@ -64,15 +64,23 @@ class AutoEncoder(nn.Module):
         self.register_buffer('last_usage', torch.zeros(num_features, dtype=torch.int64))
         self.register_buffer('eval_usage', torch.zeros(num_features, dtype=torch.int64))
 
-        self.init_weights()
         if pin_bias:
             self.decoder.bias = self.encoder.bias
 
-    def init_weights(self):
-        self.encoder.bias.data.fill_(0)
-        self.decoder.bias.data.fill_(0)
-        self.encoder.weight.data.normal_(0, 0.1)
-        self.decoder.lookup.weight.data.normal_(0, 0.1)
+    def init_weights(self, data):
+        # initialize bias to data mean
+        data_mean = data.mean(dim=0)
+        self.encoder.bias.data = data_mean.clone()
+        self.decoder.bias.data = data_mean.clone()
+
+        # normalize decoder features
+        self.norm_weights()
+
+        # tied intialization of encoder/decoder
+        self.decoder.lookup.weight.data = self.encoder.linear.weight.data.clone()
+
+    def norm_weights(self):
+        self.decoder.lookup.weight.data /= self.decoder.lookup.weight.data.norm(dim=-1, keepdim=True)
 
     def reset_usage(self):
         self.eval_usage.fill_(0)
@@ -97,8 +105,7 @@ class AutoEncoder(nn.Module):
             self.last_usage *= 1 - total.clamp(max=1) # zero out used
 
         # run decoder
-        recon = self.decoder(feats, weights)
-        embed1 = F.normalize(recon)
+        embed1 = self.decoder(feats, weights)
 
         # add in resurrected feats
         if dead_cutoff is not None:
@@ -135,13 +142,19 @@ class Trainer:
         # compute loss
         scale = sqrt(vecs.numel())
         loss0 = self.loss_fn(vecs, vecs1)
-        loss1 = self.loss_fn(vecs1 - vecs, uvecs) if uvecs is not None else 0.0
+        loss1 = self.loss_fn(vecs1.detach() - vecs, uvecs) if uvecs is not None else 0.0
         return scale * (loss0 + dead_weight*loss1)
 
     def train(
         self, data, epochs=10, max_steps=None, learning_rate=1e-3, epsilon=1e-8, grad_clip=1.0,
-        eval_steps=8, dead_cutoff=10_000, dead_topk=512, dead_weight=0.03
+        eval_steps=8, dead_cutoff=10_000, dead_topk=512, dead_weight=0.03, init_weights=True
     ):
+        # intialize weights
+        if init_weights:
+            sample_text = next(iter(data))
+            sample_vecs = self.embed(sample_text)
+            self.model.init_weights(sample_vecs)
+
         # set up optimizer
         params = self.model.parameters()
         optim = torch.optim.Adam(params, lr=learning_rate, eps=epsilon)
@@ -149,7 +162,8 @@ class Trainer:
         # run some data epochs
         for e in range(epochs):
             # standard gradient update
-            for step, batch in enumerate(tqdm(data, desc=f'EPOCH {e}')):
+            prog = tqdm(data, desc=f'EPOCH {e}')
+            for step, batch in enumerate(prog):
                 # accumulate gradients
                 optim.zero_grad()
                 loss = self.loss(
@@ -160,6 +174,13 @@ class Trainer:
                 # process and apply grads
                 nn.utils.clip_grad_norm_(params, grad_clip)
                 optim.step()
+
+                # normalize decoder weights
+                with torch.no_grad():
+                    self.model.norm_weights()
+
+                # print out loss on bar
+                prog.set_postfix_str(f'LOSS: {loss.item():.4f}')
 
                 # break if we hit max steps
                 if max_steps is not None and step >= max_steps:
@@ -177,4 +198,5 @@ class Trainer:
             # print out dead feature stats
             usage_mean = self.model.last_usage.float().mean().item()
             dead_feats = (self.model.last_usage > dead_cutoff).sum().item()
+            torch.save(self.model.last_usage.cpu(), 'last_usage.torch')
             print(f'last_usage = {usage_mean}, dead_feats = {dead_feats}')
