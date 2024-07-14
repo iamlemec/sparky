@@ -53,10 +53,12 @@ class Decoder(nn.Module):
         return embed
 
 class AutoEncoder(nn.Module):
-    def __init__(self, embed_size, num_features, topk, pin_bias=True):
+    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=10_000, dead_topk=512):
         super().__init__()
         self.num_features = num_features
         self.topk = topk
+        self.dead_cutoff = dead_cutoff
+        self.dead_topk = dead_topk
 
         self.encoder = Encoder(embed_size, num_features)
         self.decoder = Decoder(embed_size, num_features)
@@ -91,7 +93,7 @@ class AutoEncoder(nn.Module):
         return feats
 
     # embed: [batch_size, embed_size]
-    def forward(self, embed, dead_cutoff=None, dead_topk=512):
+    def forward(self, embed):
         # sparsifry and index
         project = self.encoder(embed)
         weights, feats = project.topk(self.topk, dim=-1, sorted=False)
@@ -105,22 +107,27 @@ class AutoEncoder(nn.Module):
             self.last_usage *= 1 - total.clamp(max=1) # zero out used
 
         # run decoder
-        embed1 = self.decoder(feats, weights)
+        embed_recon = self.decoder(feats, weights)
 
         # add in resurrected feats
-        if dead_cutoff is not None:
+        if self.dead_cutoff is not None:
             # find dead_topk least used features
-            dead_mask = self.last_usage > dead_cutoff
+            dead_mask = self.last_usage > self.dead_cutoff
             dead_total = dead_mask.sum().item()
-            dead_project = project[:, dead_mask]
+            dead_topk = np.minimum(self.dead_topk, dead_total)
 
-            # reconstruct undead embeddings
-            undead_topk = np.minimum(dead_topk, dead_total)
-            undead_weights, undead_feats = dead_project.topk(undead_topk, dim=-1, sorted=False)
-            undead_recon = self.decoder(undead_feats, undead_weights, bias=False)
-            return embed1, undead_recon
+            # reconstruct dead embeddings
+            if dead_topk > 0:
+                dead_project = torch.where(dead_mask, project, -torch.inf)
+                dead_weights, undead_feats = dead_project.topk(dead_topk, dim=-1, sorted=False)
+                dead_recon = self.decoder(undead_feats, dead_weights, bias=False)
+            else:
+                dead_recon = None
         else:
-            return embed1, None
+            dead_recon = None
+
+        # return pair on recons
+        return embed_recon, dead_recon
 
 class Trainer:
     def __init__(self, embed, model):
@@ -133,11 +140,11 @@ class Trainer:
             vecs = self.embed(text)
         return self.model.features(vecs)
 
-    def loss(self, text, dead_cutoff=None, dead_topk=512, dead_weight=0.03):
+    def loss(self, text, dead_weight=0.0):
         # get embeddings and run model
         with torch.no_grad():
             vecs = self.embed(text)
-        vecs1, uvecs = self.model(vecs, dead_cutoff=dead_cutoff, dead_topk=dead_topk)
+        vecs1, uvecs = self.model(vecs)
 
         # compute loss
         scale = sqrt(vecs.numel())
@@ -147,7 +154,7 @@ class Trainer:
 
     def train(
         self, data, epochs=10, max_steps=None, learning_rate=1e-3, epsilon=1e-8, grad_clip=1.0,
-        eval_steps=8, dead_cutoff=10_000, dead_topk=512, dead_weight=0.03, init_weights=True
+        eval_steps=8, dead_weight=0.03, init_weights=True
     ):
         # intialize weights
         if init_weights:
@@ -166,9 +173,7 @@ class Trainer:
             for step, batch in enumerate(prog):
                 # accumulate gradients
                 optim.zero_grad()
-                loss = self.loss(
-                    batch, dead_cutoff=dead_cutoff, dead_topk=dead_topk, dead_weight=dead_weight
-                )
+                loss = self.loss(batch, dead_weight=dead_weight)
                 loss.backward()
 
                 # process and apply grads
@@ -197,6 +202,22 @@ class Trainer:
 
             # print out dead feature stats
             usage_mean = self.model.last_usage.float().mean().item()
-            dead_feats = (self.model.last_usage > dead_cutoff).sum().item()
+            dead_feats = (self.model.last_usage > self.model.dead_cutoff).sum().item()
             torch.save(self.model.last_usage.cpu(), 'last_usage.torch')
             print(f'last_usage = {usage_mean}, dead_feats = {dead_feats}')
+
+    def feature_analysis(self, data, num_batches=8):
+        # compute feature usage
+        usage = torch.zeros((num_batches, self.model.num_features), dtype=torch.float32)
+        for i, batch in enumerate(islice(data, num_batches)):
+            feats = self.features(batch)
+            usage[i, :] = bincount(feats, self.model.num_features)
+
+        # get usage correlation
+        used = (usage > 0).float()
+        correl = (used @ used.T) / used.sum(dim=1, keepdim=True)
+
+        # get total usage
+        total = usage.sum(dim=0) / (num_batches * data.batch_size)
+
+        return total, correl
