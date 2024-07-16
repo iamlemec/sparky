@@ -23,6 +23,15 @@ def dataset_csv(path, column, batch_size=32):
     text = datf.dropna()[column].tolist()
     return torch.utils.data.DataLoader(text, batch_size=batch_size, shuffle=True)
 
+# average over vector, sum over batch
+def mse_loss(x, y, dim=-1):
+    return F.mse_loss(x, y, reduction='sum') / x.size(dim)
+
+# here x should be the model and y should be the data
+def mse_norm_loss(x, y, dim=-1):
+    y_mean = x.mean(dim, keepdim=True).broadcast_to(x.shape)
+    return mse_loss(x, y, dim=dim) / mse_loss(y, y_mean, dim=dim)
+
 # maps from embedding to dense weights
 # this is single layer for now but could be higher
 class Encoder(nn.Module):
@@ -53,7 +62,7 @@ class Decoder(nn.Module):
         return embed
 
 class AutoEncoder(nn.Module):
-    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=10_000, dead_topk=512):
+    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=50_000, dead_topk=None):
         super().__init__()
         self.num_features = num_features
         self.topk = topk
@@ -65,6 +74,7 @@ class AutoEncoder(nn.Module):
 
         self.register_buffer('last_usage', torch.zeros(num_features, dtype=torch.int64))
         self.register_buffer('eval_usage', torch.zeros(num_features, dtype=torch.int64))
+        self.register_buffer('test_usage', torch.zeros(num_features, dtype=torch.int64))
 
         if pin_bias:
             self.decoder.bias = self.encoder.bias
@@ -102,6 +112,7 @@ class AutoEncoder(nn.Module):
         with torch.no_grad():
             batch_size, _ = embed.shape
             total = bincount(feats, self.num_features)
+            self.test_usage = total
             self.eval_usage += total
             self.last_usage += batch_size # increment all
             self.last_usage *= 1 - total.clamp(max=1) # zero out used
@@ -114,7 +125,7 @@ class AutoEncoder(nn.Module):
             # find dead_topk least used features
             dead_mask = self.last_usage > self.dead_cutoff
             dead_total = dead_mask.sum().item()
-            dead_topk = np.minimum(self.dead_topk, dead_total)
+            dead_topk = dead_total // 2 if self.dead_topk is None else self.dead_topk # eleuther heuristic
 
             # reconstruct dead embeddings
             if dead_topk > 0:
@@ -133,7 +144,6 @@ class Trainer:
     def __init__(self, embed, model):
         self.embed = embed
         self.model = model
-        self.loss_fn = torch.nn.MSELoss()
 
     def features(self, text):
         with torch.no_grad():
@@ -145,16 +155,16 @@ class Trainer:
         with torch.no_grad():
             vecs = self.embed(text)
         vecs1, uvecs = self.model(vecs)
+        error = vecs1.detach() - vecs
 
         # compute loss
-        scale = sqrt(vecs.numel())
-        loss0 = self.loss_fn(vecs, vecs1)
-        loss1 = self.loss_fn(vecs1.detach() - vecs, uvecs) if uvecs is not None else 0.0
-        return scale * (loss0 + dead_weight*loss1)
+        loss0 = mse_loss(vecs1, vecs)
+        loss1 = mse_norm_loss(uvecs, error) if uvecs is not None else 0.0
+        return loss0 + dead_weight * loss1
 
     def train(
-        self, data, epochs=10, max_steps=None, learning_rate=1e-3, epsilon=1e-8, grad_clip=1.0,
-        eval_steps=8, dead_weight=0.03, init_weights=True
+        self, data, epochs=10, max_steps=None, learning_rate=1e-4, epsilon=1e-9, grad_clip=10.0,
+        eval_steps=8, dead_weight=0.1, init_weights=True
     ):
         # intialize weights
         if init_weights:
@@ -185,7 +195,8 @@ class Trainer:
                     self.model.norm_weights()
 
                 # print out loss on bar
-                prog.set_postfix_str(f'LOSS: {loss.item():.4f}')
+                test_dead = (self.model.test_usage == 0).float().mean().item()
+                prog.set_postfix_str(f'loss = {loss.item():6.4f}, dead = {test_dead:.4f}')
 
                 # break if we hit max steps
                 if max_steps is not None and step >= max_steps:
@@ -197,14 +208,14 @@ class Trainer:
                 eval_loss = sum([
                     self.loss(b).item() for b in islice(data, eval_steps)
                 ]) / eval_steps
-                dead_frac = (self.model.eval_usage == 0).float().mean().item()
-            print(f'LOSS: {eval_loss}, DEAD: {dead_frac}')
+                eval_dead = (self.model.eval_usage == 0).float().mean().item()
+            print(f'EVAL: loss = {eval_loss:6.4f}, dead = {eval_dead:.4f}')
 
             # print out dead feature stats
             usage_mean = self.model.last_usage.float().mean().item()
-            dead_feats = (self.model.last_usage > self.model.dead_cutoff).sum().item()
+            dead_feats = (self.model.last_usage > self.model.dead_cutoff).float().mean().item()
             torch.save(self.model.last_usage.cpu(), 'last_usage.torch')
-            print(f'last_usage = {usage_mean}, dead_feats = {dead_feats}')
+            print(f'STAT: last = {usage_mean}, dead = {dead_feats:.4f}')
 
     def feature_analysis(self, data, num_batches=8):
         # compute feature usage
