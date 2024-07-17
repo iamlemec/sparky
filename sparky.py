@@ -158,7 +158,7 @@ class Trainer:
         error = vecs1.detach() - vecs
 
         # compute loss
-        loss0 = mse_loss(vecs1, vecs)
+        loss0 = mse_norm_loss(vecs1, vecs)
         loss1 = mse_norm_loss(uvecs, error) if uvecs is not None else 0.0
         return loss0 + dead_weight * loss1
 
@@ -232,3 +232,20 @@ class Trainer:
         total = usage.sum(dim=0) / (num_batches * data.batch_size)
 
         return total, correl
+
+def setup_trainer(num_features, topk, data_path, embed_path, column_name='abstract', batch_size=8192, device='cuda', dtype=torch.float32):
+    from ziggy import LlamaCppEmbedding
+
+    # load data
+    dataset = dataset_csv(data_path, column_name, batch_size=batch_size)
+
+    # load embedding model
+    embed = LlamaCppEmbedding(embed_path, dtype=dtype)
+
+    # create model
+    sae = AutoEncoder(embed.dims, num_features, topk).to(device)
+
+    # make trainer
+    train = Trainer(embed, sae)
+
+    return train, dataset
