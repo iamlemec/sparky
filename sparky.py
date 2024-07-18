@@ -62,12 +62,13 @@ class Decoder(nn.Module):
         return embed
 
 class AutoEncoder(nn.Module):
-    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=50_000, dead_topk=None):
+    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=50_000, dead_topk=None, fuzz_factor=1.0):
         super().__init__()
         self.num_features = num_features
         self.topk = topk
         self.dead_cutoff = dead_cutoff
         self.dead_topk = dead_topk
+        self.fuzz_factor = fuzz_factor
         self.initialized = False
 
         self.encoder = Encoder(embed_size, num_features)
@@ -133,7 +134,8 @@ class AutoEncoder(nn.Module):
 
             # reconstruct dead embeddings
             if dead_topk > 0:
-                dead_project = torch.where(dead_mask, project, -torch.inf)
+                project_fuzz = project + self.fuzz_factor * project.std() * torch.randn_like(project)
+                dead_project = torch.where(dead_mask, project_fuzz, -torch.inf)
                 dead_weights, undead_feats = dead_project.topk(dead_topk, dim=-1, sorted=False)
                 dead_recon = self.decoder(undead_feats, dead_weights, bias=False)
             else:
@@ -203,6 +205,9 @@ class Trainer:
                 test_dead = (self.model.test_usage == 0).float().mean().item()
                 prog.set_postfix_str(f'loss = {loss.item():6.4f}, dead = {test_dead:.4f}')
 
+                # save last_usage stats
+                torch.save(self.model.last_usage.cpu(), 'last_usage.torch')
+
                 # break if we hit max steps
                 if max_steps is not None and step >= max_steps:
                     break
@@ -219,7 +224,6 @@ class Trainer:
             # print out dead feature stats
             usage_mean = self.model.last_usage.float().mean().item()
             dead_feats = (self.model.last_usage > self.model.dead_cutoff).float().mean().item()
-            torch.save(self.model.last_usage.cpu(), 'last_usage.torch')
             print(f'STAT: last = {usage_mean}, dead = {dead_feats:.4f}')
 
     def feature_analysis(self, data, num_batches=8):
