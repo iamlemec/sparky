@@ -68,6 +68,7 @@ class AutoEncoder(nn.Module):
         self.topk = topk
         self.dead_cutoff = dead_cutoff
         self.dead_topk = dead_topk
+        self.initialized = False
 
         self.encoder = Encoder(embed_size, num_features)
         self.decoder = Decoder(embed_size, num_features)
@@ -90,6 +91,9 @@ class AutoEncoder(nn.Module):
 
         # tied intialization of encoder/decoder
         self.decoder.lookup.weight.data = self.encoder.linear.weight.data.clone()
+
+        # set initialized flag
+        self.initialized = True
 
     def norm_weights(self):
         self.decoder.lookup.weight.data /= self.decoder.lookup.weight.data.norm(dim=-1, keepdim=True)
@@ -144,6 +148,7 @@ class Trainer:
     def __init__(self, embed, model):
         self.embed = embed
         self.model = model
+        self.initialized = False
 
     def features(self, text):
         with torch.no_grad():
@@ -164,10 +169,10 @@ class Trainer:
 
     def train(
         self, data, epochs=10, max_steps=None, learning_rate=1e-4, epsilon=1e-9, grad_clip=10.0,
-        eval_steps=8, dead_weight=0.1, init_weights=True
+        eval_steps=8, dead_weight=0.1
     ):
         # intialize weights
-        if init_weights:
+        if not self.model.initialized:
             sample_text = next(iter(data))
             sample_vecs = self.embed(sample_text)
             self.model.init_weights(sample_vecs)
@@ -243,7 +248,7 @@ def setup_trainer(num_features, topk, data_path, embed_path, column_name='abstra
     embed = LlamaCppEmbedding(embed_path, dtype=dtype)
 
     # create model
-    sae = AutoEncoder(embed.dims, num_features, topk).to(device)
+    sae = AutoEncoder(embed.dims, num_features, topk).to(device=device, dtype=dtype)
 
     # make trainer
     train = Trainer(embed, sae)
