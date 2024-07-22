@@ -18,9 +18,9 @@ def bincount(x, size):
     return total.scatter_add_(0, x.reshape(-1), ones)
 
 # load in csv text dataset by column name
-def dataset_csv(path, column, batch_size=32):
-    datf = pd.read_csv(path, usecols=[column])
-    text = datf.dropna()[column].tolist()
+def dataset_csv(path, columns, batch_size=32):
+    datf = pd.read_csv(path, usecols=columns).dropna()[columns]
+    text = ['\n'.join(row) for row in datf.itertuples(index=False)]
     return torch.utils.data.DataLoader(text, batch_size=batch_size, shuffle=True)
 
 # average over vector, sum over batch
@@ -62,7 +62,7 @@ class Decoder(nn.Module):
         return embed
 
 class AutoEncoder(nn.Module):
-    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=50_000, dead_topk=None, fuzz_factor=1.0):
+    def __init__(self, embed_size, num_features, topk, pin_bias=True, dead_cutoff=100_000, dead_topk=None, fuzz_factor=1.0):
         super().__init__()
         self.num_features = num_features
         self.topk = topk
@@ -80,6 +80,15 @@ class AutoEncoder(nn.Module):
 
         if pin_bias:
             self.decoder.bias = self.encoder.bias
+
+    def load_weights(self, path):
+        state_dict = torch.load(path)
+        self.load_state_dict(state_dict)
+        self.initialized = True
+
+    def save_weights(self, path):
+        state_dict = self.state_dict()
+        torch.save(state_dict, path)
 
     def init_weights(self, data):
         # initialize bias to data mean
@@ -104,7 +113,7 @@ class AutoEncoder(nn.Module):
 
     def features(self, embed):
         project = self.encoder(embed)
-        weights, feats = project.topk(self.topk, dim=-1, sorted=False)
+        weights, feats = project.topk(self.topk, dim=-1)
         return feats
 
     # embed: [batch_size, embed_size]
@@ -112,6 +121,7 @@ class AutoEncoder(nn.Module):
         # sparsifry and index
         project = self.encoder(embed)
         weights, feats = project.topk(self.topk, dim=-1, sorted=False)
+        embed_recon = self.decoder(feats, weights)
 
         # accumulate usage stats
         with torch.no_grad():
@@ -122,35 +132,39 @@ class AutoEncoder(nn.Module):
             self.last_usage += batch_size # increment all
             self.last_usage *= 1 - total.clamp(max=1) # zero out used
 
-        # run decoder
-        embed_recon = self.decoder(feats, weights)
-
         # add in resurrected feats
         if self.dead_cutoff is not None:
             # find dead_topk least used features
             dead_mask = self.last_usage > self.dead_cutoff
             dead_total = dead_mask.sum().item()
-            dead_topk = dead_total // 2 if self.dead_topk is None else self.dead_topk # eleuther heuristic
+            if self.dead_topk is None:
+                dead_topk = dead_total // 2 # eleuther heuristic
+            else:
+                dead_topk = min(dead_total, self.dead_topk)
 
             # reconstruct dead embeddings
             if dead_topk > 0:
-                project_fuzz = project + self.fuzz_factor * project.std() * torch.randn_like(project)
-                dead_project = torch.where(dead_mask, project_fuzz, -torch.inf)
-                dead_weights, undead_feats = dead_project.topk(dead_topk, dim=-1, sorted=False)
-                dead_recon = self.decoder(undead_feats, dead_weights, bias=False)
+                fuzz_sample = self.fuzz_factor * project.std() * torch.randn_like(project)
+                dead_project = torch.where(dead_mask, project + fuzz_sample, -torch.inf)
+                _, undead_feats = dead_project.topk(dead_topk, dim=-1, sorted=False)
+                undead_weights = project.gather(-1, undead_feats)
+                undead_recon = self.decoder(undead_feats, undead_weights, bias=False)
             else:
-                dead_recon = None
+                undead_recon = None
         else:
-            dead_recon = None
+            undead_recon = None
 
         # return pair on recons
-        return embed_recon, dead_recon
+        return embed_recon, undead_recon
 
 class Trainer:
-    def __init__(self, embed, model):
+    def __init__(self, embed, model, learning_rate=1e-4, epsilon=1e-9):
         self.embed = embed
         self.model = model
-        self.initialized = False
+
+        # set up optimizer
+        self.params = self.model.parameters()
+        self.optim = torch.optim.Adam(self.params, lr=learning_rate, eps=epsilon)
 
     def features(self, text):
         with torch.no_grad():
@@ -170,8 +184,7 @@ class Trainer:
         return loss0 + dead_weight * loss1
 
     def train(
-        self, data, epochs=10, max_steps=None, learning_rate=1e-4, epsilon=1e-9, grad_clip=10.0,
-        eval_steps=8, dead_weight=0.1
+        self, data, epochs=10, max_steps=None, grad_clip=10.0, eval_steps=8, dead_weight=0.1
     ):
         # intialize weights
         if not self.model.initialized:
@@ -179,23 +192,19 @@ class Trainer:
             sample_vecs = self.embed(sample_text)
             self.model.init_weights(sample_vecs)
 
-        # set up optimizer
-        params = self.model.parameters()
-        optim = torch.optim.Adam(params, lr=learning_rate, eps=epsilon)
-
         # run some data epochs
         for e in range(epochs):
             # standard gradient update
             prog = tqdm(data, desc=f'EPOCH {e}')
             for step, batch in enumerate(prog):
                 # accumulate gradients
-                optim.zero_grad()
+                self.optim.zero_grad()
                 loss = self.loss(batch, dead_weight=dead_weight)
                 loss.backward()
 
                 # process and apply grads
-                nn.utils.clip_grad_norm_(params, grad_clip)
-                optim.step()
+                nn.utils.clip_grad_norm_(self.params, grad_clip)
+                self.optim.step()
 
                 # normalize decoder weights
                 with torch.no_grad():
@@ -242,17 +251,17 @@ class Trainer:
 
         return total, correl
 
-def setup_trainer(num_features, topk, data_path, embed_path, column_name='abstract', batch_size=8192, device='cuda', dtype=torch.float32):
+def setup_trainer(num_features, topk, data_path, embed_path, columns=['title', 'abstract'], batch_size=8192, device='cuda', dtype=torch.float32, **kwargs):
     from ziggy import LlamaCppEmbedding
 
     # load data
-    dataset = dataset_csv(data_path, column_name, batch_size=batch_size)
+    dataset = dataset_csv(data_path, columns, batch_size=batch_size)
 
     # load embedding model
     embed = LlamaCppEmbedding(embed_path, dtype=dtype)
 
     # create model
-    sae = AutoEncoder(embed.dims, num_features, topk).to(device=device, dtype=dtype)
+    sae = AutoEncoder(embed.dims, num_features, topk, **kwargs).to(device=device, dtype=dtype)
 
     # make trainer
     train = Trainer(embed, sae)
